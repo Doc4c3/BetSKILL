@@ -1,0 +1,23 @@
+# 截图/图片
+*.jpg
+*.png
+*.jpeg
+*.gif
+
+# 会话数据
+session_*.zip
+kimi-export-*.md
+.chatbox/
+chatbox-logs-*.txt
+
+# 日期数据目录
+2026*/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 系统
+.DS_Store
+Thumbs.db
