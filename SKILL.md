@@ -19,18 +19,97 @@ pip install shin soccerdata
 - `shin`：Shin(1992) 赔率去水算法，输入赔率→输出去 overround 后的真实隐含概率
 - `soccerdata`：一站式拉取 FBref（xG/射门/控球）、ClubElo（实力评分）、WhoScored（比赛统计）
 
-### 1.2 读取用户提供的赔率截图
+### 1.2 OCR 赔率提取范式
 
-用户通常提供微信截图，包含以下盘口数据：
+截图 → 结构化赔率的**三层回退流水线**。
 
-- **胜平负**：主胜 / 平 / 主负 赔率
-- **让球胜平负**：带让球数的三向赔率（如 `(+1)` `(-2)`）
-- **比分**：所有可能比分的对应赔率
+#### 层 1：AI 原生视觉（优先）
 
-**方法**：
-1. 用 `Glob` 或 `Bash ls` 定位图片文件
-2. 优先使用 `ReadMediaFile` 直接读取；若不可用，请用户**手动 OCR 粘贴赔率文本**（当前已验证最可靠路径）
-3. 将赔率结构化保存为内部变量
+```python
+# kimi 内置 ReadMediaFile 直接读取图片内容
+# 如可用，无需任何 OCR 库
+```
+
+- 使用 `ReadMediaFile(path)` 读取截图
+- 从图片中直接提取赔率数字和文字标签
+- **如果触发了包含 `ReadMediaFile` 的 skill 加载，优先此路径**
+
+#### 层 2：Tesseract CLI（备选）
+
+```bash
+# Windows 下需预装 Tesseract-OCR
+tesseract screenshot.jpg stdout -l chi_sim+eng
+```
+
+- 适用：已安装 Tesseract 的系统
+- 输出为原始文本，需走层 4 解析
+
+#### 层 3：用户手动粘贴（最可靠，当前默认）
+
+用户用微信/系统 OCR 提取文本后，按以下**固定模板**粘贴。一行一场比赛：
+
+```
+场次编号 主队 VS 客队
+胜平负: 主胜赔率 平赔率 主负赔率
+让球(+N或-N): 主胜赔率 平赔率 主负赔率
+比分: 1:0=赔率, 2:0=赔率, 2:1=赔率, 0:0=赔率, 1:1=赔率, ...
+```
+
+#### 层 4：文本解析引擎
+
+无论 OCR 路径，最终文本统一走以下解析器：
+
+```python
+import re
+
+def parse_odds_text(text: str) -> dict:
+    """
+    输入：OCR 文本（层1/2/3的输出）
+    输出：{match_id: {home, away, odds_1x2, handicap, scores}}
+    """
+    matches = {}
+    blocks = text.strip().split('\n\n')  # 按空行分隔场次
+    
+    for block in blocks:
+        # 解析场次编号和队名
+        header = re.match(r'(\d+)\s+(.+?)\s+VS\s+(.+)', block)
+        if not header: continue
+        mid, home, away = header.groups()
+        
+        # 解析胜平负: "2.32 2.50 3.35"
+        m_1x2 = re.search(r'胜平负[：:]\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)', block)
+        
+        # 解析让球: "让球(+1): 2.18 3.45 2.63"
+        m_hc = re.search(r'让球\(([+-]\d+)\)[：:]\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)', block)
+        
+        # 解析比分: "1:0=6.50, 2:0=10.00, ..."
+        scores_raw = re.findall(r'(\d+):(\d+)=(\d+\.?\d*)', block)
+        scores = {f'{h}:{a}': float(o) for h, a, o in scores_raw}
+        
+        matches[mid] = {
+            'home': home.strip(),
+            'away': away.strip(),
+            'odds_1x2': [float(x) for x in m_1x2.groups()] if m_1x2 else None,
+            'handicap': {
+                'line': int(m_hc.group(1)),
+                'odds': [float(x) for x in m_hc.groups()[1:]]
+            } if m_hc else None,
+            'scores': scores
+        }
+    return matches
+```
+
+#### OCR 验证规则
+
+解析后强制执行以下检查，防止 OCR 错误污染后续概率计算：
+
+| 检查 | 规则 | 失败处理 |
+|------|------|----------|
+| 赔率范围 | 1.01 < odds < 1000 | 标记异常，请求用户复核 |
+| booksum | 1/主 + 1/平 + 1/客 ∈ [1.05, 1.30] | 超标=OCR 漏字/多字 |
+| 比分完整性 | 至少含 0:0, 1:0, 0:1, 1:1, 2:0, 0:2 | 缺失=截图不完整 |
+| 让球方向 | (±1) 或 (±2)，与对阵强弱一致 | 方向反=请用户确认 |
+| 场次编号 | 连续、不重复 | 跳号=缺截图 |
 
 ### 1.3 赛前情报搜索（双通道）
 
