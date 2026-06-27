@@ -21,70 +21,59 @@ pip install shin soccerdata
 
 ### 1.2 OCR 赔率提取范式
 
-截图 → 结构化赔率的**三层回退流水线**。
+> ⚠️ DeepSeek V4 Pro 不支持原生视觉，`ReadMediaFile` 不可用。以下为适配方案。
 
-#### 层 1：AI 原生视觉（优先）
+#### 主路径：用户粘贴模板（最可靠）
 
-```python
-# kimi 内置 ReadMediaFile 直接读取图片内容
-# 如可用，无需任何 OCR 库
-```
-
-- 使用 `ReadMediaFile(path)` 读取截图
-- 从图片中直接提取赔率数字和文字标签
-- **如果触发了包含 `ReadMediaFile` 的 skill 加载，优先此路径**
-
-#### 层 2：Tesseract CLI（备选）
-
-```bash
-# Windows 下需预装 Tesseract-OCR
-tesseract screenshot.jpg stdout -l chi_sim+eng
-```
-
-- 适用：已安装 Tesseract 的系统
-- 输出为原始文本，需走层 4 解析
-
-#### 层 3：用户手动粘贴（最可靠，当前默认）
-
-用户用微信/系统 OCR 提取文本后，按以下**固定模板**粘贴。一行一场比赛：
+用户用微信/系统 OCR 提取截图文本后，按**固定模板**粘贴。一行一场，之间空行分隔：
 
 ```
 场次编号 主队 VS 客队
 胜平负: 主胜赔率 平赔率 主负赔率
 让球(+N或-N): 主胜赔率 平赔率 主负赔率
-比分: 1:0=赔率, 2:0=赔率, 2:1=赔率, 0:0=赔率, 1:1=赔率, ...
+比分: 1:0=赔率, 2:0=赔率, 2:1=赔率, 0:0=赔率, 1:1=赔率, 0:1=赔率, 1:2=赔率, 0:2=赔率, ...
 ```
 
-#### 层 4：文本解析引擎
+**粘贴提示词**（直接复制发给用户）：
+> 请用微信截图 → 长按提取文字 → 全选复制粘贴给我。格式如下，一场一段：
+> ```
+> 061 挪威 VS 法国
+> 胜平负: 4.65 3.90 1.52
+> 让球(+1): 2.18 3.45 2.63
+> 比分: 1:0=16.00, 2:0=28.00, 2:1=12.50, 0:0=16.00, 1:1=6.90, 0:1=8.30, 1:2=6.50, 0:2=8.25, ...
+> ```
 
-无论 OCR 路径，最终文本统一走以下解析器：
+#### 可选自动化：Tesseract CLI
+
+```bash
+# Windows 需预装 Tesseract-OCR (https://github.com/UB-Mannheim/tesseract/wiki)
+tesseract screenshot.jpg stdout -l chi_sim+eng
+```
+输出走解析引擎层处理。
+
+#### 解析引擎
+
+无论来源，最终文本统一走以下 Python 解析器：
 
 ```python
 import re
 
 def parse_odds_text(text: str) -> dict:
     """
-    输入：OCR 文本（层1/2/3的输出）
+    输入：模板格式文本
     输出：{match_id: {home, away, odds_1x2, handicap, scores}}
     """
     matches = {}
-    blocks = text.strip().split('\n\n')  # 按空行分隔场次
+    blocks = text.strip().split('\n\n')
     
     for block in blocks:
-        # 解析场次编号和队名
         header = re.match(r'(\d+)\s+(.+?)\s+VS\s+(.+)', block)
         if not header: continue
         mid, home, away = header.groups()
         
-        # 解析胜平负: "2.32 2.50 3.35"
         m_1x2 = re.search(r'胜平负[：:]\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)', block)
-        
-        # 解析让球: "让球(+1): 2.18 3.45 2.63"
         m_hc = re.search(r'让球\(([+-]\d+)\)[：:]\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)', block)
-        
-        # 解析比分: "1:0=6.50, 2:0=10.00, ..."
         scores_raw = re.findall(r'(\d+):(\d+)=(\d+\.?\d*)', block)
-        scores = {f'{h}:{a}': float(o) for h, a, o in scores_raw}
         
         matches[mid] = {
             'home': home.strip(),
@@ -94,19 +83,17 @@ def parse_odds_text(text: str) -> dict:
                 'line': int(m_hc.group(1)),
                 'odds': [float(x) for x in m_hc.groups()[1:]]
             } if m_hc else None,
-            'scores': scores
+            'scores': {f'{h}:{a}': float(o) for h, a, o in scores_raw}
         }
     return matches
 ```
 
 #### OCR 验证规则
 
-解析后强制执行以下检查，防止 OCR 错误污染后续概率计算：
-
 | 检查 | 规则 | 失败处理 |
 |------|------|----------|
 | 赔率范围 | 1.01 < odds < 1000 | 标记异常，请求用户复核 |
-| booksum | 1/主 + 1/平 + 1/客 ∈ [1.05, 1.30] | 超标=OCR 漏字/多字 |
+| booksum | Σ(1/odds) ∈ [1.05, 1.30] | 超标=OCR 漏字/多字 |
 | 比分完整性 | 至少含 0:0, 1:0, 0:1, 1:1, 2:0, 0:2 | 缺失=截图不完整 |
 | 让球方向 | (±1) 或 (±2)，与对阵强弱一致 | 方向反=请用户确认 |
 | 场次编号 | 连续、不重复 | 跳号=缺截图 |
